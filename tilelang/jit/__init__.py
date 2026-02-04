@@ -5,7 +5,6 @@ This module provides an auto-tuning infrastructure for TileLang (tl) programs.
 It includes functionality to JIT-compile TileLang programs into a runnable 
 kernel adapter using TVM.
 """
-from .jit_npu import compiler_npu
 
 from typing import (
     Any,
@@ -27,6 +26,7 @@ from tilelang.cache import cached
 from os import path, makedirs
 from logging import getLogger
 import functools
+import inspect
 from tilelang.jit.param import Kernel, _P, _RProg
 
 logger = getLogger(__name__)
@@ -35,9 +35,11 @@ logger = getLogger(__name__)
 def compile(
     func: PrimFunc = None,
     out_idx: Union[List[int], int, None] = None,
+    workspace_idx: Union[List[int], int, None] = None,
     execution_backend: Literal["dlpack", "ctypes", "cython"] = "cython",
     target: Union[str, Target] = "auto",
     target_host: Union[str, Target] = None,
+    platform: Literal["A2", "A3", "A5"] = "A3",
     verbose: bool = False,
     pass_configs: Optional[Dict[str, Any]] = None,
 ) -> JITKernel:
@@ -49,12 +51,16 @@ def compile(
         The TileLang TIR function to compile and wrap.
     out_idx : Union[List[int], int], optional
         Index(es) of the output tensors to return (default: None).
+    workspace_idx : Union[List[int], int], optional
+        Index(es) of the auto-allocated workspace tensors.
     execution_backend : Literal["dlpack", "ctypes"], optional
         Execution backend to use for kernel execution (default: "dlpack").
     target : Union[str, Target], optional
         Compilation target, either as a string or a TVM Target object (default: "auto").
     target_host : Union[str, Target], optional
         Target host for cross-compilation (default: None).
+    platform : Literal
+        Specifies the target hardware platform generation. Defaults to "A3".
     verbose : bool, optional
         Whether to enable verbose output (default: False).
     pass_configs : dict, optional
@@ -67,16 +73,17 @@ def compile(
             "tl.disable_dynamic_tail_split": bool, default: False
             "tl.dynamic_vectorize_size_bits": int, default: 128
             "tl.disable_safe_memory_legalize": bool, default: False
+            "tl.ascend_auto_sync": bool, default: False
+            "tl.ascend_memory_planning": bool, default: False
     """
-    if target == 'npuir':
-        compile_npuir = compiler_npu()
-        return compile_npuir.compile(func)
     return cached(
         func=func,
         out_idx=out_idx,
+        workspace_idx=workspace_idx,
         execution_backend=execution_backend,
         target=target,
         target_host=target_host,
+        platform=platform,
         verbose=verbose,
         pass_configs=pass_configs,
     )
@@ -85,17 +92,24 @@ def compile(
 class _JitImplementation:
 
     out_idx: Any
+    workspace_idx: Any
     target: Union[str, Target]
     target_host: Union[str, Target]
+    platform: str
     execution_backend: Literal["dlpack", "ctypes", "cython"]
     verbose: bool
     pass_configs: Optional[Dict[str, Any]]
     debug_root_path: Optional[str]
+    func: Optional[Callable] = None  # Store the original function
+    signature: Optional[Any] = None  # Store the signature
+    wrapper: Optional[Callable] = None  # Store the wrapped function for autotuner access
 
     def __init__(self,
                  out_idx: Any = None,
+                 workspace_idx: Any = None,
                  target: Union[str, Target] = "auto",
                  target_host: Union[str, Target] = None,
+                 platform: Literal["A2", "A3", "A5"] = "A3",
                  execution_backend: Literal["dlpack", "ctypes", "cython"] = "cython",
                  verbose: bool = False,
                  pass_configs: Optional[Dict[str, Any]] = None,
@@ -108,12 +122,16 @@ class _JitImplementation:
         out_idx : Any, optional
             Index(es) of the output tensors to return from the compiled kernel
             (default: None, meaning all outputs are returned or determined by the kernel itself).
+        workspace_idx : Any, optional
+            Index(es) of the auto-allocated workspace tensors.
         target : Union[str, Target], optional
             Compilation target for TVM. Can be a string (e.g., "cuda", "llvm")
             or a TVM Target object. If "auto", the target is determined automatically
             (default: "auto").
         target_host : Union[str, Target], optional
             Target host for cross-compilation, similar to `target` (default: None).
+        platform : Literal
+            Specifies the target hardware platform generation. Defaults to "A3".
         execution_backend : Literal["dlpack", "ctypes", "cython"], optional
             The backend used for kernel execution and argument passing.
             "dlpack" is generally preferred for zero-copy tensor passing with compatible frameworks.
@@ -133,11 +151,15 @@ class _JitImplementation:
             or current working directory.
         """
         self.out_idx = out_idx
+        self.workspace_idx = workspace_idx
         self.execution_backend = execution_backend
         self.target = target
         self.target_host = target_host
+        self.platform = platform
         self.verbose = verbose
         self.pass_configs = pass_configs
+        self.func = None
+        self.signature = None
 
         # Corrected debug_root_path handling
         self.debug_root_path = debug_root_path
@@ -165,6 +187,9 @@ class _JitImplementation:
         self,
         func: Callable[_P, _RProg]  # func is Union[Callable[_P, _RProg], PrimFunc] in original
     ) -> Callable[_P, Any]:
+        # Store the function and its signature for autotuner access
+        self.func = func
+        self.signature = inspect.signature(func)
 
         @functools.wraps(func)
         def wrapper(*args: _P.args, **kwargs: _P.kwargs) -> Any:
@@ -188,9 +213,11 @@ class _JitImplementation:
                 kernel_result = compile(
                     program_result,
                     out_idx=self.out_idx,
+                    workspace_idx=self.workspace_idx,
                     execution_backend=self.execution_backend,
                     target=self.target,
                     target_host=self.target_host,
+                    platform=self.platform,
                     verbose=self.verbose,
                     pass_configs=self.pass_configs,
                 )
@@ -209,6 +236,11 @@ class _JitImplementation:
 
             return self._kernel_cache[key]
 
+        # Attach reference to _JitImplementation for autotuner to access
+        wrapper.__jit_impl__ = self
+        # Store the wrapper for autotuner to call it directly
+        self.wrapper = wrapper
+
         return wrapper
 
 
@@ -216,8 +248,10 @@ def jit(  # This is the new public interface
         func: Union[Callable[_P, _RProg], PrimFunc, None] = None,
         *,  # Indicates subsequent arguments are keyword-only
         out_idx: Any = None,
+        workspace_idx: Any = None,
         target: Union[str, Target] = "auto",
         target_host: Union[str, Target] = None,
+        platform: Literal["A2", "A3", "A5"] = "A3",
         execution_backend: Literal["dlpack", "ctypes", "cython"] = "cython",
         verbose: bool = False,
         pass_configs: Optional[Dict[str, Any]] = None,
@@ -234,10 +268,14 @@ def jit(  # This is the new public interface
         If using `@tilelang.jit(...)` to configure, this is the `out_idx` parameter.
         If using `@tilelang.jit` directly on a function, this argument is implicitly
         the function to be decorated (and `out_idx` will be `None`).
+    workspace_idx : Any, optional
+        Index(es) of the auto-allocated workspace tensors.
     target : Union[str, Target], optional
         Compilation target for TVM (e.g., "cuda", "llvm"). Defaults to "auto".
     target_host : Union[str, Target], optional
         Target host for cross-compilation. Defaults to None.
+    platform : Literal
+        Specifies the target hardware platform generation. Defaults to "A3".
     execution_backend : Literal["dlpack", "ctypes", "cython"], optional
         Backend for kernel execution and argument passing. Defaults to "cython".
     verbose : bool, optional
@@ -256,10 +294,13 @@ def jit(  # This is the new public interface
     if callable(func):
         # Case 1: Used as @jit (func_or_out_idx is the function, others are defaults)
         # Create a default _JitImplementation instance and apply it to the function.
+        print("<<<< line 297 Case 1 Used as @jit(...)")
         default_decorator = _JitImplementation(
             out_idx=out_idx,  # Explicitly None for the default case
+            workspace_idx=workspace_idx,
             target=target,
             target_host=target_host,
+            platform=platform,
             execution_backend=execution_backend,
             verbose=verbose,
             pass_configs=pass_configs,
@@ -271,12 +312,15 @@ def jit(  # This is the new public interface
         # Case 2: Used as @jit(...) to configure, or func_or_out_idx is meant as out_idx.
         # Create a _JitImplementation instance with the provided/defaulted arguments.
         # This instance is a decorator that will be applied to the function later.
+        print("<<<< line 314 Case 2 Used as @jit(...)")
         configured_decorator = _JitImplementation(
             out_idx=out_idx,  # Pass along; could be an actual out_idx or None
+            workspace_idx=workspace_idx,
             target=target,
             target_host=target_host,
+            platform=platform,
             execution_backend=execution_backend,
             verbose=verbose,
             pass_configs=pass_configs,
             debug_root_path=debug_root_path)
-        return configured_decorator
+        return configured_decorator

@@ -65,6 +65,29 @@ TILELANG_CACHE_DIR: str = os.environ.get("TILELANG_CACHE_DIR",
 # Auto-clear cache if environment variable is set
 TILELANG_CLEAR_CACHE = os.environ.get("TILELANG_CLEAR_CACHE", "0")
 
+# Auto-tuning related environment variables (used by autotuner.tuner)
+# CPU utilization ratio when TILELANG_AUTO_TUNING_CPU_COUNTS is not set (>0)
+_DEFAULT_CPU_UTILS = "0.9"
+_DEFAULT_CPU_COUNTS = "-1"   # 0 means use utilization ratio
+_DEFAULT_CPU_MAX = "-1"      # 0 means no hard cap
+
+def _get_env_number(name: str, default: str) -> str:
+    val = os.environ.get(name, default)
+    # Basic validation: allow int/float strings only; fallback to default if invalid
+    try:
+        float(val)
+    except ValueError:
+        logger.warning(f"Invalid value '{val}' for {name}, fallback to {default}.")
+        val = default
+    return val
+
+TILELANG_AUTO_TUNING_CPU_UTILITIES: str = _get_env_number(
+    "TILELANG_AUTO_TUNING_CPU_UTILITIES", _DEFAULT_CPU_UTILS)
+TILELANG_AUTO_TUNING_CPU_COUNTS: str = _get_env_number(
+    "TILELANG_AUTO_TUNING_CPU_COUNTS", _DEFAULT_CPU_COUNTS)
+TILELANG_AUTO_TUNING_MAX_CPU_COUNT: str = _get_env_number(
+    "TILELANG_AUTO_TUNING_MAX_CPU_COUNT", _DEFAULT_CPU_MAX)
+
 # SETUP ENVIRONMENT VARIABLES
 CUTLASS_NOT_FOUND_MESSAGE = ("CUTLASS is not installed or found in the expected path")
 ", which may lead to compilation bugs when utilize tilelang backend."
